@@ -20,6 +20,8 @@ def run(script: str, *args: str) -> None:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description="一键构建可溯源的 PDF RAG 索引")
     ap.add_argument("pdf", help="输入 PDF")
     ap.add_argument("--out-dir", default="", help="输出目录，默认 <pdf名>-rag")
