@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Generated PDF indexes
+*-rag/
+type.json
+structure.json
+chunks.jsonl
+index_meta.json
+image_descriptions.json
+
+# Archives and logs
+*.zip
+*.log
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local credentials and secrets
+.env
+.env.*
+*.pem
+*.key

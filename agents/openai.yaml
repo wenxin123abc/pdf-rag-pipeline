@@ -1,0 +1,6 @@
+interface:
+  display_name: "PDF Rag Pipeline"
+  short_description: "将文本型 PDF 构建为可检索、可溯源且便于评测的 RAG 索引"
+  default_prompt: "Use $pdf-rag-pipeline to index this PDF and verify page-level citations."
+policy:
+  allow_implicit_invocation: true
