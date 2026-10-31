@@ -70,6 +70,7 @@ def main() -> None:
         "--max-chars", str(args.max_chars),
     )
     run("pdf_tools.py", "stats", str(chunks_path))
+    run("inspect_index.py", str(structure_path), str(chunks_path))
     print(f"\n完成。索引目录: {out_dir}")
     if report.get("doc_type") == "mixed":
         print("注意：这是 mixed PDF；无文本页和图表仍需 OCR/视觉补充。")

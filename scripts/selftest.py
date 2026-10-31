@@ -91,6 +91,21 @@ def make_two_column_sample(path: Path) -> None:
     doc.close()
 
 
+def make_three_column_sample(path: Path) -> None:
+    doc = pymupdf.open()
+    page = doc.new_page(width=720, height=842)
+    for column, x in enumerate((40, 260, 480)):
+        for row in range(3):
+            page.insert_textbox(
+                pymupdf.Rect(x, 80 + row * 110, x + 180, 170 + row * 110),
+                f"C{column + 1}R{row + 1} paragraph text for column ordering.",
+                fontsize=10,
+                fontname="helv",
+            )
+    doc.save(path)
+    doc.close()
+
+
 def make_image_only_sample(path: Path) -> None:
     doc = pymupdf.open()
     page = doc.new_page(width=595, height=842)
@@ -159,6 +174,19 @@ def main() -> None:
 
         image = next((c for c in parsed if c["chunk_type"] == "image"), None)
         if image:
+            visual_queue = root / "visual-queue"
+            run(
+                str(SCRIPT_DIR / "visual_queue.py"),
+                str(chunks),
+                "--pdf", str(pdf),
+                "--out", str(visual_queue),
+            )
+            prompts = json.loads(
+                (visual_queue / "prompts.json").read_text(encoding="utf-8")
+            )
+            if not prompts or not (visual_queue / prompts[0]["png_path"]).exists():
+                raise AssertionError("视觉队列没有生成裁剪图片")
+
             mapping = root / "image_descriptions.json"
             mapping.write_text(
                 json.dumps({image["image_id"]: "A plain blue-gray diagram."}),
@@ -174,6 +202,39 @@ def main() -> None:
             )
             if json.loads(stats.stdout)["visual_descriptions_pending"] != 0:
                 raise AssertionError("视觉描述回填后仍有待处理项")
+
+        eval_labels = root / "labels.jsonl"
+        eval_labels.write_text(
+            json.dumps({
+                "question": "payment terms",
+                "gold_chunk_ids": [hits[0]["chunk_id"]],
+                "gold_pages": [hits[0]["page"]],
+                "answer_type": "fact",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        run(
+            str(SCRIPT_DIR / "eval.py"),
+            str(eval_labels),
+            str(chunks),
+            "--json",
+            "--min-recall", "0.9",
+        )
+        run(
+            str(SCRIPT_DIR / "inspect_index.py"),
+            str(structure),
+            str(chunks),
+        )
+        preview = root / "preview.html"
+        run(
+            str(SCRIPT_DIR / "preview.py"),
+            str(chunks),
+            "--pdf", str(pdf),
+            "--out", str(preview),
+            "--query", "payment terms",
+        )
+        if not preview.exists() or "data:image/png;base64," not in preview.read_text(encoding="utf-8"):
+            raise AssertionError("离线预览未生成嵌入页面")
 
         one_click = root / "one-click"
         run(
@@ -196,6 +257,37 @@ def main() -> None:
         )["columns"]["max_detected"]
         if columns != 2:
             raise AssertionError(f"双栏检测失败: {columns}")
+
+        three_column_pdf = root / "three-column.pdf"
+        three_column_report = root / "three-column.json"
+        three_column_structure = root / "three-column-structure.json"
+        make_three_column_sample(three_column_pdf)
+        run(
+            str(SCRIPT_DIR / "detect_pdf_type.py"),
+            str(three_column_pdf),
+            "--out", str(three_column_report),
+        )
+        columns = json.loads(
+            three_column_report.read_text(encoding="utf-8")
+        )["columns"]["max_detected"]
+        if columns != 3:
+            raise AssertionError(f"三栏检测失败: {columns}")
+        run(
+            str(SCRIPT_DIR / "extract_structure.py"),
+            str(three_column_pdf),
+            "--out", str(three_column_structure),
+            "--columns", "3",
+        )
+        extracted = json.loads(
+            three_column_structure.read_text(encoding="utf-8")
+        )
+        text_order = [
+            block["text"][:2]
+            for block in extracted["pages"][0]["blocks"]
+        ]
+        expected_prefixes = ["C1", "C1", "C1", "C2", "C2", "C2", "C3", "C3", "C3"]
+        if text_order != expected_prefixes:
+            raise AssertionError(f"三栏阅读顺序错误: {text_order}")
 
         scanned_pdf = root / "scanned.pdf"
         scanned_report = root / "scanned.json"
@@ -225,7 +317,7 @@ def main() -> None:
             raise AssertionError("扫描件应停止并返回退出码 2")
 
         print("PASS: PDF type detection, structure extraction, chunking, search,")
-        print("      cross-page sections, two-column/scanned detection, visual annotations")
+        print("      cross-page sections, 1-3 column ordering, evals, preview, visual queue")
 
 
 if __name__ == "__main__":

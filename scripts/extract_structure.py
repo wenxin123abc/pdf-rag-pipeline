@@ -15,10 +15,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
 from collections import Counter
 from pathlib import Path
+
+from errors import EXIT_ENCRYPTED, EXIT_NO_TEXT, fail
+from layout import detect_column_bands, order_blocks_by_columns
 
 HEADER_BAND = 0.085   # 页面上/下 8.5% 视为页眉页脚候选带
 FOOTER_BAND = 0.915
@@ -63,11 +67,11 @@ def open_pdf(fitz, path: Path, password: str):
     try:
         doc = fitz.open(path)
     except Exception as exc:
-        sys.exit(f"无法打开 PDF: {exc}")
+        fail(f"无法打开 PDF: {exc}", EXIT_ENCRYPTED)
     if getattr(doc, "needs_pass", False):
         if not password or not doc.authenticate(password):
             doc.close()
-            sys.exit("PDF 已加密，请通过 --password 提供正确密码")
+            fail("PDF 需要密码，密码错误或文档已损坏", EXIT_ENCRYPTED)
     return doc
 
 
@@ -206,24 +210,13 @@ def detect_repeat_margins(all_blocks: list[list[dict]], heights: list[float]) ->
                 if key not in seen:
                     counter[key] += 1
                     seen.add(key)
-    need = max(2, int(len(all_blocks) * REPEAT_RATIO))
+    need = max(3, math.ceil(len(all_blocks) * REPEAT_RATIO))
     return {k for k, v in counter.items() if v >= need}
 
 
 def order_blocks(blocks: list[dict], width: float, columns: int) -> list[dict]:
     """多栏排版下按栏再按 y 排序，避免左右栏串行。"""
-    if columns <= 1 or width <= 0:
-        return sorted(blocks, key=lambda b: (round(b["bbox"][1], 1), b["bbox"][0]))
-    ncols = max(2, min(columns, 4))
-
-    def column_of(block: dict) -> int:
-        center = (block["bbox"][0] + block["bbox"][2]) / 2
-        return max(0, min(ncols - 1, int(center / width * ncols)))
-
-    return sorted(
-        blocks,
-        key=lambda b: (column_of(b), round(b["bbox"][1], 1), b["bbox"][0]),
-    )
+    return order_blocks_by_columns(blocks, width, columns)
 
 
 def guess_heading(body_size: float, blk: dict) -> tuple[bool, int | None]:
@@ -271,6 +264,44 @@ def table_to_markdown(rows: list[list]) -> str:
              "| " + " | ".join(["---"] * width) + " |"]
     lines += ["| " + " | ".join(r) + " |" for r in body]
     return "\n".join(lines)
+
+
+def _table_overlap_ratio(first: dict, second: dict) -> float:
+    a0, _, a1, _ = first["bbox"]
+    b0, _, b1, _ = second["bbox"]
+    overlap = max(0.0, min(a1, b1) - max(a0, b0))
+    narrower = max(1.0, min(a1 - a0, b1 - b0))
+    return overlap / narrower
+
+
+def merge_cross_page_tables(pages: list[dict]) -> list[dict]:
+    """Merge an uncaptioned table continuation into the preceding page table."""
+    for index in range(len(pages) - 1):
+        current_tables = pages[index].get("tables") or []
+        next_tables = pages[index + 1].get("tables") or []
+        if not current_tables or not next_tables:
+            continue
+        first = current_tables[-1]
+        second = next_tables[0]
+        if second.get("caption"):
+            continue
+        if _table_overlap_ratio(first, second) < 0.8:
+            continue
+
+        first_lines = str(first["markdown"]).splitlines()
+        second_lines = str(second["markdown"]).splitlines()
+        continuation = second_lines[2:] if len(second_lines) > 2 else []
+        if continuation:
+            first["markdown"] = "\n".join(first_lines + continuation)
+        first["page_end"] = second.get("page_end") or pages[index + 1]["page"]
+        first["rows"] = int(first.get("rows", 0)) + max(0, int(second.get("rows", 0)) - 1)
+        first["cols"] = max(int(first.get("cols", 0)), int(second.get("cols", 0)))
+        first["continuation_table_ids"] = [
+            *first.get("continuation_table_ids", []),
+            second["id"],
+        ]
+        next_tables.pop(0)
+    return pages
 
 
 def extract(path: Path, columns: int, password: str = "") -> dict:
@@ -417,6 +448,7 @@ def extract(path: Path, columns: int, password: str = "") -> dict:
             "images": images,
         })
 
+    pages_out = merge_cross_page_tables(pages_out)
     total_pages = len(doc)
     metadata = dict(doc.metadata or {})
     doc.close()
@@ -451,7 +483,9 @@ def main() -> None:
 
     data = extract(path, args.columns, args.password)
     if not data["pages_total"]:
-        sys.exit("PDF 没有可处理页面")
+        fail("PDF 没有可处理页面", EXIT_NO_TEXT)
+    if not any(page.get("blocks") for page in data["pages"]):
+        fail("PDF 中没有可提取的有效文本", EXIT_NO_TEXT)
     out = Path(args.out) if args.out else path.with_suffix(".structure.json")
     write_json_atomic(out, data)
 

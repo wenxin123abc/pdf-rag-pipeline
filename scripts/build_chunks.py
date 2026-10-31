@@ -87,13 +87,13 @@ def make_prefix(title: str, page: int, section: str, prev: str, nxt: str, self_s
     return "｜".join(parts)
 
 
-def find_caption(page: dict, img_bbox: list[float]) -> tuple[str, str]:
-    """返回 (图片题注, 图内文字)。
+def find_caption(page: dict, img_bbox: list[float]) -> tuple[str, str, str]:
+    """返回 (图片题注, 图内文字, 题注块 ID)。
 
     图内文字（图表标题、坐标轴标签、示意图里的说明）对检索极有价值——
     这些内容 OCR 抽不出来，只能靠读文本块或视觉模型。
     """
-    best, best_d = "", IMAGE_GAP
+    best, best_d, best_id = "", IMAGE_GAP, ""
     embedded = []
     for blk in page["blocks"]:
         text = squash(blk["text"])
@@ -108,35 +108,59 @@ def find_caption(page: dict, img_bbox: list[float]) -> tuple[str, str]:
         gap = gap_below if 0 <= gap_below <= IMAGE_GAP else (
             gap_above if 0 <= gap_above <= IMAGE_GAP else 1e9)
         if gap < best_d:
-            best, best_d = text, gap
-    return best, " / ".join(embedded)
+            best, best_d, best_id = text, gap, str(blk.get("id") or "")
+    return best, " / ".join(embedded), best_id
 
 
-def split_long(text: str, max_chars: int) -> list[str]:
-    """超长块按句子切，保证不把句子切断。"""
+def split_long(text: str, max_chars: int) -> list[tuple[str, bool]]:
+    """Split long text at sentence, clause, then word boundaries.
+
+    The boolean marks a fallback hard cut where no safe boundary existed.
+    """
+    if max_chars <= 0:
+        raise ValueError("max_chars 必须大于 0")
     if len(text) <= max_chars:
-        return [text]
-    sentences = re.split(r"(?<=[。！？；\n])", text)
-    out, buf = [], ""
-    for s in sentences:
-        if not s:
+        return [(text, False)]
+
+    pieces: list[tuple[str, bool]] = []
+    for sentence in re.split(r"(?<=[。！？；\n])", text):
+        if not sentence:
             continue
-        if len(buf) + len(s) > max_chars and buf:
-            out.append(buf)
-            buf = s
+        if len(sentence) <= max_chars:
+            pieces.append((sentence, False))
+            continue
+        for clause in re.split(r"(?<=[，、,])", sentence):
+            if not clause:
+                continue
+            if len(clause) <= max_chars:
+                pieces.append((clause, False))
+                continue
+            for word_piece in re.split(r"(?<=\s)", clause):
+                if not word_piece:
+                    continue
+                if len(word_piece) <= max_chars:
+                    pieces.append((word_piece, False))
+                    continue
+                for start in range(0, len(word_piece), max_chars):
+                    pieces.append((word_piece[start:start + max_chars], True))
+
+    output: list[tuple[str, bool]] = []
+    buffer = ""
+    buffer_hard_cut = False
+    for piece, hard_cut in pieces:
+        if buffer and len(buffer) + len(piece) > max_chars:
+            output.append((buffer, buffer_hard_cut))
+            buffer = ""
+            buffer_hard_cut = False
+        if not buffer:
+            buffer = piece
+            buffer_hard_cut = hard_cut
         else:
-            buf += s
-    if buf.strip():
-        out.append(buf)
-    # 极端情况（单句超长）硬切
-    final = []
-    for seg in out:
-        while len(seg) > max_chars:
-            final.append(seg[:max_chars])
-            seg = seg[max_chars:]
-        if seg.strip():
-            final.append(seg)
-    return final
+            buffer += piece
+            buffer_hard_cut = buffer_hard_cut or hard_cut
+    if buffer.strip():
+        output.append((buffer, buffer_hard_cut))
+    return [(part, hard_cut) for part, hard_cut in output if part]
 
 
 def build(data: dict, pdf_path: Path, max_chars: int) -> tuple[list[dict], dict]:
@@ -179,6 +203,14 @@ def build(data: dict, pdf_path: Path, max_chars: int) -> tuple[list[dict], dict]
                 "quote_anchor": quote_anchor(pno),
             })
 
+        image_data = []
+        caption_block_ids = set()
+        for image in page.get("images") or []:
+            caption, embedded, caption_block_id = find_caption(page, image["bbox"])
+            if caption_block_id:
+                caption_block_ids.add(caption_block_id)
+            image_data.append((image, caption, embedded))
+
         buffer: list[dict] = []
         buffer_path: list[str] = []
         section_no = 0
@@ -198,7 +230,7 @@ def build(data: dict, pdf_path: Path, max_chars: int) -> tuple[list[dict], dict]
                 max(b[3] for b in boxes),
             ] if boxes else [0, 0, page["width"], page["height"]]
             source_ids = [b.get("id", "") for b in buf]
-            for part in split_long(raw, max_chars):
+            for part, hard_cut in split_long(raw, max_chars):
                 order += 1
                 section_no += 1
                 chunks.append({
@@ -214,13 +246,14 @@ def build(data: dict, pdf_path: Path, max_chars: int) -> tuple[list[dict], dict]
                     "bbox": merged_bbox,
                     "source_block_ids": source_ids,
                     "text": part,
+                    "truncated": hard_cut,
                     "context_prefix": "",
                     "embed_text": "",
                     "quote_anchor": quote_anchor(pno, merged_bbox),
                 })
 
         for blk in page_blocks:
-            if blk.get("in_image"):
+            if blk.get("in_image") or blk.get("id") in caption_block_ids:
                 continue
             embedded_path = blk.get("section_path")
             if isinstance(embedded_path, list):
@@ -262,12 +295,14 @@ def build(data: dict, pdf_path: Path, max_chars: int) -> tuple[list[dict], dict]
             markdown = table["markdown"]
             text = f"{caption}\n{markdown}" if caption else markdown
             path = list(table.get("section_path") or page_path_for_bbox(table["bbox"]))
+            page_end = int(table.get("page_end") or pno)
             chunks.append({
                 "chunk_id": f"{doc_id}-{table['id']}",
                 "doc_id": doc_id,
                 "doc_title": title,
                 "source_sha256": source_sha,
                 "page": pno,
+                "page_end": page_end,
                 "chunk_type": "table",
                 "order": order,
                 "section_path": path,
@@ -281,11 +316,15 @@ def build(data: dict, pdf_path: Path, max_chars: int) -> tuple[list[dict], dict]
                 "text": text,
                 "context_prefix": "",
                 "embed_text": "",
-                "quote_anchor": quote_anchor(pno, table["bbox"], table=table["id"]),
+                "quote_anchor": quote_anchor(
+                    pno,
+                    table["bbox"],
+                    table=table["id"],
+                    page_end=str(page_end) if page_end != pno else "",
+                ),
             })
 
-        for image in page.get("images") or []:
-            caption, embedded = find_caption(page, image["bbox"])
+        for image, caption, embedded in image_data:
             description = str(image.get("visual_desc") or "").strip()
             order += 1
             parts = [f"[图片] {caption or '无题注'}"]
@@ -315,6 +354,7 @@ def build(data: dict, pdf_path: Path, max_chars: int) -> tuple[list[dict], dict]
                 "height_px": image["height_px"],
                 "visual_desc": description or None,
                 "needs_visual_desc": not bool(description),
+                "truncated": False,
                 "text": text,
                 "context_prefix": "",
                 "embed_text": "",
@@ -360,6 +400,7 @@ def build(data: dict, pdf_path: Path, max_chars: int) -> tuple[list[dict], dict]
         "needs_visual_desc": sum(
             1 for c in chunks if c.get("needs_visual_desc")
         ),
+        "truncated_chunks": sum(1 for c in chunks if c.get("truncated")),
         "avg_chars": round(
             sum(c["char_len"] for c in chunks) / max(len(chunks), 1), 1
         ),

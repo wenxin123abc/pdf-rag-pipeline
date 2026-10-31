@@ -20,6 +20,7 @@
 | `doc_title` | str | 是 | 文档标题，取首个标题块或文件名 |
 | `source_sha256` | str | 是 | 原始 PDF 的完整内容哈希 |
 | `page` | int | 是 | 页码，1 起 |
+| `page_end` | int | 否 | 跨页表格结束页；普通 chunk 省略 |
 | `chunk_type` | str | 是 | page / section / table / image |
 | `order` | int | 是 | 在文档中的先后序号，用于取前后文 |
 | `section_path` | list[str] | 是 | 章节路径，如 `["第三章 违约责任"]` |
@@ -36,6 +37,7 @@
 | `embedded_text` | str | 否 | 图内文字（图表标题、坐标轴标签、示意图说明） |
 | `visual_desc` | str\|null | 否 | 视觉模型生成的图片描述，未回填为 null |
 | `needs_visual_desc` | bool | 否 | 是否待补视觉描述 |
+| `truncated` | bool | 否 | section 是否发生过无法避免的硬切 |
 
 ## 为什么 text 与 embed_text 分离
 
@@ -59,7 +61,7 @@
 | 参数 | 默认 | 调整依据 |
 |---|---|---|
 | `--max-chars` | 900 | 合同/条款类可降到 500（一条一 chunk）；研报/叙述类可升到 1200 |
-| 切分边界 | 块边界/句边界 | 正常句子不切断；单句仍超限时才兜底硬切 |
+| 切分边界 | 句 → 子句 → 词 | 依次尝试 `。！？；`、`，、,`、空格；都找不到才硬切并标记 `truncated` |
 | 重叠 | 无 | 靠 `context_prefix` 补跨度信息；重叠会增加重复命中 |
 
 章节路径按阅读顺序跨页延续。表格和图片继承其版面位置之前的最近章节，不再固定为空数组。
@@ -78,6 +80,7 @@
 - 页眉页脚（跨页重复的页码、公司名、"内部资料"）——污染检索，降低区分度
 - 表格区域内的散落文本块——已由 table chunk 承载，重复进正文会让数值类问题命中两处、答案不一致
 - 图内文字——归 image chunk，否则会在正文里形成假段落
+- 图题题注——已有 image chunk 承载，不得重复进入 section
 - 目录页——除非用户明确要查目录
 
 ## 校验
@@ -86,4 +89,4 @@
 python scripts/pdf_tools.py stats chunks.jsonl
 ```
 
-关注四个数：`chunks` 总量（太少说明切片过粗）、`by_type` 分布（table/image 为 0 而文档明明有图表 → 检测失败）、`待补视觉描述`（未回填会导致图表类问题答不出）、`平均 chunk 长度`（超过 1000 说明该调小 `--max-chars`）。
+关注 `chunks` 总量、`by_type` 分布、`待补视觉描述`、`平均 chunk 长度` 和 `硬切 chunk`。table/image 应有而全为 0、平均长度超过 1000 或出现硬切，都是继续调解析和切片参数的信号。

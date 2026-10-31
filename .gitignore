@@ -15,6 +15,15 @@ structure.json
 chunks.jsonl
 index_meta.json
 image_descriptions.json
+inspection.json
+preview.html
+corpus/
+rag-out/
+visual-queue/
+queue/
+
+# Generated retrieval caches
+.*.bm25-*.json
 
 # Archives and logs
 *.zip

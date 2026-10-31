@@ -40,9 +40,13 @@
 
 回填方式：`build_chunks.py` 把 image chunk 标记为 `needs_visual_desc: true`。视觉模型或人工产出 `{image_id: description}` JSON 后，用 `apply_visual_descriptions.py` 把描述写入 `visual_desc` 并重新生成 `embed_text`。检查未回填数量：
 
+`visual_queue.py` 会按 bbox 裁图、对 PNG 内容做 SHA-256、生成 `prompts.json` 和 `descriptions.template.json`。它只负责确定性预处理，视觉理解仍交给调用方选择的多模态模型。
+
 ```bash
 python scripts/pdf_tools.py stats chunks.jsonl
 ```
+
+人工验收可运行 `preview.py` 生成离线 HTML；结构异常可交给 `inspect_index.py` 自动检查。两者都不依赖托管服务。
 
 ## 何时该换方案
 

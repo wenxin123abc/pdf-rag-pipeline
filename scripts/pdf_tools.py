@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
 import sys
 from collections import Counter
 from pathlib import Path
+
+from normalization import normalize_text
 
 K1, B = 1.5, 0.75
 CJK = r"\u3400-\u4dbf\u4e00-\u9fff"
@@ -17,6 +20,8 @@ REQUIRED_FIELDS = (
     "chunk_id", "doc_id", "doc_title", "page", "chunk_type",
     "section_path", "text", "embed_text", "quote_anchor",
 )
+INDEX_FORMAT_VERSION = 1
+TOKENIZER_VERSION = 2
 
 
 def resolve_index(value: str) -> Path:
@@ -47,6 +52,7 @@ def load_chunks(path: Path) -> list[dict]:
 
 
 def tokenize(text: str) -> list[str]:
+    text = normalize_text(text)
     tokens: list[str] = []
     for match in TOKEN_RE.finditer(text):
         token = match.group()
@@ -58,35 +64,97 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
-def bm25_scores(query: str, chunks: list[dict]) -> list[float]:
-    query_terms = set(tokenize(query))
-    if not query_terms:
-        return [0.0] * len(chunks)
-    docs = [tokenize(c.get("embed_text") or c.get("text", "")) for c in chunks]
-    avg_len = sum(len(doc) for doc in docs) / max(len(docs), 1)
-    document_frequency = Counter()
-    for doc in docs:
-        document_frequency.update(set(doc))
-    total = len(docs)
-    scores = []
-    for doc in docs:
-        frequencies = Counter(doc)
-        length = len(doc) or 1
-        score = 0.0
-        for term in query_terms:
-            frequency = frequencies.get(term, 0)
-            if not frequency:
-                continue
-            inverse_frequency = math.log(
-                1 + (total - document_frequency[term] + 0.5)
-                / (document_frequency[term] + 0.5)
-            )
-            score += inverse_frequency * (
+def tokenize_weighted(text: str) -> dict[str, float]:
+    normalized = normalize_text(text)
+    weights: dict[str, float] = {}
+    for match in TOKEN_RE.finditer(normalized):
+        token = match.group()
+        if token[0].isascii():
+            weights[token.lower()] = 1.0
+            continue
+        for character in token:
+            weights[character] = max(weights.get(character, 0.0), 0.4)
+        for index in range(len(token) - 1):
+            bigram = token[index:index + 2]
+            weights[bigram] = 1.0
+    return weights
+
+
+def build_bm25_index_data(chunks: list[dict], source_sha256: str) -> dict:
+    lengths = []
+    postings: dict[str, list[list[int]]] = {}
+    document_frequency: Counter = Counter()
+    for index, chunk in enumerate(chunks):
+        tokens = tokenize(chunk.get("embed_text") or chunk.get("text", ""))
+        lengths.append(len(tokens) or 1)
+        frequencies = Counter(tokens)
+        for term, frequency in frequencies.items():
+            postings.setdefault(term, []).append([index, frequency])
+            document_frequency[term] += 1
+    return {
+        "format_version": INDEX_FORMAT_VERSION,
+        "tokenizer_version": TOKENIZER_VERSION,
+        "source_sha256": source_sha256,
+        "documents": len(chunks),
+        "lengths": lengths,
+        "average_length": sum(lengths) / max(len(lengths), 1),
+        "document_frequency": dict(document_frequency),
+        "postings": postings,
+    }
+
+
+def load_or_build_bm25_index(path: Path, chunks: list[dict]) -> tuple[dict, Path]:
+    source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    cache_path = path.with_name(f".{path.name}.bm25-{source_hash[:16]}.json")
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                cached.get("format_version") == INDEX_FORMAT_VERSION
+                and cached.get("tokenizer_version") == TOKENIZER_VERSION
+                and cached.get("source_sha256") == source_hash
+                and cached.get("documents") == len(chunks)
+            ):
+                return cached, cache_path
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+    index = build_bm25_index_data(chunks, source_hash)
+    tmp = cache_path.with_name(cache_path.name + ".tmp")
+    tmp.write_text(json.dumps(index, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(cache_path)
+    return index, cache_path
+
+
+def bm25_scores_from_index(query: str, index: dict) -> list[float]:
+    query_terms = tokenize_weighted(query)
+    total = int(index["documents"])
+    scores = [0.0] * total
+    if not query_terms or not total:
+        return scores
+    lengths = index["lengths"]
+    average_length = float(index["average_length"])
+    document_frequency = index["document_frequency"]
+    for term, query_weight in query_terms.items():
+        frequency_in_documents = int(document_frequency.get(term, 0))
+        if not frequency_in_documents:
+            continue
+        inverse_frequency = math.log(
+            1 + (total - frequency_in_documents + 0.5)
+            / (frequency_in_documents + 0.5)
+        )
+        for document_index, frequency in index["postings"].get(term, []):
+            length = lengths[document_index] or 1
+            scores[document_index] += query_weight * inverse_frequency * (
                 frequency * (K1 + 1)
-                / (frequency + K1 * (1 - B + B * length / avg_len))
+                / (frequency + K1 * (1 - B + B * length / average_length))
             )
-        scores.append(score)
     return scores
+
+
+def bm25_scores(query: str, chunks: list[dict]) -> list[float]:
+    index = build_bm25_index_data(chunks, "in-memory")
+    return bm25_scores_from_index(query, index)
 
 
 def flatten(text: str) -> str:
@@ -126,6 +194,8 @@ def result_record(score: float, chunk: dict, query: str) -> dict:
     return {
         "score": round(score, 4),
         "chunk_id": chunk["chunk_id"],
+        "doc_id": chunk.get("doc_id", ""),
+        "doc_title": chunk.get("doc_title", ""),
         "page": chunk["page"],
         "type": chunk["chunk_type"],
         "section": " > ".join(chunk.get("section_path") or []),
@@ -137,14 +207,40 @@ def result_record(score: float, chunk: dict, query: str) -> dict:
 def cmd_search(args) -> None:
     if args.k <= 0:
         sys.exit("-k 必须大于 0")
-    chunks = load_chunks(resolve_index(args.index))
+    index_path = resolve_index(args.index)
+    chunks = load_chunks(index_path)
+    selected = set(range(len(chunks)))
     if args.type:
         allowed = {part.strip() for part in args.type.split(",") if part.strip()}
-        chunks = [c for c in chunks if c.get("chunk_type") in allowed]
-    if not chunks:
-        sys.exit("没有可检索的 chunk（检查 --type）")
+        selected = {
+            index for index in selected
+            if chunks[index].get("chunk_type") in allowed
+        }
+    if args.doc:
+        selector = args.doc.casefold()
+        selected = {
+            index for index in selected
+            if selector in str(chunks[index].get("doc_id", "")).casefold()
+            or selector in str(chunks[index].get("doc_title", "")).casefold()
+        }
+    if not selected:
+        sys.exit("没有可检索的 chunk（检查 --type / --doc）")
 
-    hits = search_hits(chunks, args.query, args.k, args.min_score)
+    search_index, _ = load_or_build_bm25_index(index_path, chunks)
+    scores = bm25_scores_from_index(args.query, search_index)
+    ranked = sorted(
+        selected,
+        key=lambda index: (
+            -scores[index],
+            chunks[index].get("page", 0),
+            chunks[index].get("order", 0),
+        ),
+    )
+    hits = [
+        (scores[index], chunks[index])
+        for index in ranked
+        if scores[index] > args.min_score
+    ][:args.k]
     if args.json:
         print(json.dumps(
             [result_record(score, chunk, args.query) for score, chunk in hits],
@@ -158,8 +254,8 @@ def cmd_search(args) -> None:
     for index, (score, chunk) in enumerate(hits, 1):
         record = result_record(score, chunk, args.query)
         heading = (
-            f"[{index}] p{chunk['page']} · {chunk['chunk_type']} "
-            f"· score={score:.2f}"
+            f"[{index}] {chunk.get('doc_title') or chunk.get('doc_id', '')} "
+            f"· p{chunk['page']} · {chunk['chunk_type']} · score={score:.2f}"
         )
         if record["section"]:
             heading += f" · {record['section']}"
@@ -226,6 +322,9 @@ def cmd_read(args) -> None:
     if not pages:
         available = sorted({c["page"] for c in chunks if c.get("page")})
         sys.exit(f"第 {args.page} 页无可提取文本；有内容的页: {available[:30]}")
+    if args.json:
+        print(json.dumps(pages[0], ensure_ascii=False, indent=2))
+        return
     print(render_chunk(pages[0]))
 
 
@@ -280,6 +379,7 @@ def cmd_stats(args) -> None:
         and c.get("needs_visual_desc")
         and not c.get("visual_desc")
     ]
+    truncated = sum(1 for chunk in chunks if chunk.get("truncated"))
     result = {
         "chunks": len(chunks),
         "by_type": dict(by_type),
@@ -291,6 +391,7 @@ def cmd_stats(args) -> None:
             1,
         ),
         "visual_descriptions_pending": len(visual_pending),
+        "truncated_chunks": truncated,
         "duplicate_chunk_ids": duplicates,
         "missing_required_fields": missing,
     }
@@ -301,6 +402,7 @@ def cmd_stats(args) -> None:
         page_range = f"{pages[0]}~{pages[-1]}" if pages else "-"
         print(f"覆盖页数 = {len(pages)}  页码范围 = {page_range}")
         print(f"待补视觉描述 = {len(visual_pending)}")
+        print(f"硬切 chunk = {truncated}")
         print(f"平均 chunk 长度 = {result['average_chars']:.1f} 字符")
         print(f"重复 chunk_id = {len(duplicates)}")
         print(f"缺字段 chunk = {len(missing)}")
@@ -319,6 +421,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("-k", type=int, default=5)
     search.add_argument("--type", default="", help="如 page,section,table,image")
+    search.add_argument("--doc", default="", help="按 doc_id 或文档标题关键词过滤")
     search.add_argument("--min-score", type=float, default=0.0)
     search.add_argument("--json", action="store_true")
     search.set_defaults(func=cmd_search)
@@ -326,6 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
     read = sub.add_parser("read", help="读取指定 PDF 页")
     read.add_argument("index")
     read.add_argument("--page", type=int, required=True)
+    read.add_argument("--json", action="store_true")
     read.set_defaults(func=cmd_read)
 
     table = sub.add_parser("table", help="按表格 id 或页码读取结构化表格")

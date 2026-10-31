@@ -6,13 +6,14 @@ Agent 只通过这五个动作接触 PDF，不允许"把整本塞进上下文"�
 
 | 工具 | 输入 | 输出 | 何时调用 |
 |---|---|---|---|
-| `search_pdf` | query, k, 类型过滤 | 片段列表（含 page、chunk_id、score、snippet） | 大多数问题的第一步 |
+| `search_pdf` | query, k, 类型/doc 过滤 | 片段列表（含 doc、page、chunk_id、score、snippet） | 大多数问题的第一步 |
 | `read_page` | page | 该页全文 | 片段不够、需要看整页上下文 |
 | `extract_table` | table_id 或页码 | 结构化表格 | 涉及数值、对比、汇总 |
 | `analyze_chart` | image_id | 图表结论 | 涉及趋势、结构、示意图 |
 | `quote_source` | chunk_id | 原文片段 + 页码锚点 | 需要给出引用时 |
 
 本地实现对应 `pdf_tools.py` 的 `search` / `read` / `table` / `image` / `quote` / `stats`。`table` 和 `image` 支持按页码或唯一 ID 读取；图表结论由视觉模型生成描述后用 `apply_visual_descriptions.py` 回填。
+批量语料由 `build_corpus.py` 生成统一的 `chunks.jsonl`，再用 `search --doc` 限定文档。
 
 ## 路由规则
 
@@ -30,6 +31,8 @@ Agent 只通过这五个动作接触 PDF，不允许"把整本塞进上下文"�
 ## 检索实现要点
 
 - **BM25 + 中文 unigram/bigram**：英文/数字按词切，中文同时保留单字和双字，避免单词查询完全失配。零第三方依赖，适合小到中型文档。
+- **归一化和权重**：查询先做 NFKC 和常用繁简归一化；中文单字权重 0.4，双字权重 1.0。
+- **倒排缓存**：首次查询构建 `term -> (doc, tf)` JSON 索引，文件名包含源文件 SHA-256；源文件变化后自动重建。使用 JSON 而不是 pickle，避免缓存文件被替换时产生反序列化执行风险。
 - **检索字段**：用 `embed_text`（含上下文前缀），不是 `text`。
 - **必须回页码**：任何检索结果都要带 `page` 和 `chunk_id`，否则无法溯源。
 - **类型过滤**：`--type table` 能让数值类问题的信噪比明显提升。
@@ -51,13 +54,23 @@ Agent 只通过这五个动作接触 PDF，不允许"把整本塞进上下文"�
 
 评测集构造：从真实文档里抽 30-50 条问题，覆盖上述六种问题类型，每条标注正确答案 + 正确页码 + 依据 chunk_id。
 
+实际实现：
+
+```bash
+python scripts/eval.py --template-out labels.template.jsonl chunks.jsonl
+python scripts/eval.py labels.jsonl chunks.jsonl --k 5 --min-recall 0.9
+```
+
+标签字段和示例见 [eval-labels.md](eval-labels.md)。`--json` 可供 CI 读取，`--min-recall` 可在低于基线时让流水线失败。
+
 ## 防幻觉
 
-三道闸：
+四道闸：
 
 1. **强制引用**：回答必须带页码，或直接给出原文片段。没有依据就说"文档中未找到"，不要推测。
 2. **页码可跳转**：前端渲染时点击引用能定位到页面 `bbox` 位置。`quote_anchor` 字段就是为此准备。
-3. **数值二次核对**：涉及金额、比例、日期时，回 `quote` 取表格原值核对，不要用模型复述的数字。
+3. **离线预览**：`preview.py` 把页面图和 bbox 高亮嵌入单文件 HTML，适合人工验收。
+4. **数值二次核对**：涉及金额、比例、日期时，回 `quote` 取表格原值核对，不要用模型复述的数字。
 
 ## 离线预计算
 

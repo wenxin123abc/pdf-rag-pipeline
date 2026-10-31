@@ -16,7 +16,11 @@ import argparse
 import hashlib
 import json
 import sys
+from collections import Counter
 from pathlib import Path
+
+from errors import EXIT_ENCRYPTED, EXIT_NO_TEXT, fail
+from layout import detect_column_bands
 
 TEXT_THRESHOLD = 50        # 单页可提取字符数低于此值视为"无文本层"
 EMPTY_PAGE_RATIO_SCAN = 0.6   # 无文本页占比超过此值 -> 扫描件
@@ -58,11 +62,11 @@ def open_pdf(fitz, path: Path, password: str):
     try:
         doc = fitz.open(path)
     except Exception as exc:
-        sys.exit(f"无法打开 PDF: {exc}")
+        fail(f"无法打开 PDF: {exc}", EXIT_ENCRYPTED)
     if getattr(doc, "needs_pass", False):
         if not password or not doc.authenticate(password):
             doc.close()
-            sys.exit("PDF 已加密，请通过 --password 提供正确密码")
+            fail("PDF 需要密码，密码错误或文档已损坏", EXIT_ENCRYPTED)
     return doc
 
 
@@ -93,44 +97,32 @@ def analyze_page(page) -> dict:
 
 
 def detect_columns(page) -> int:
-    """根据正文块的横向覆盖带估计 1-4 栏。
+    """Estimate 1-4 columns from left-edge clusters in body blocks."""
+    blocks = [
+        {"bbox": item[:4], "text": item[4]}
+        for item in page.get_text("blocks")
+        if len(item) >= 5 and str(item[4]).strip()
+    ]
+    bands = detect_column_bands(
+        blocks,
+        page.rect.width or 1.0,
+        max_columns=4,
+        min_blocks=3,
+        min_width_ratio=0.15,
+    )
+    return min(4, max(1, len(bands)))
 
-    跨栏标题和通栏块不参与列带统计，避免一个标题把所有间隔填满。
-    """
-    blocks = [b for b in page.get_text("blocks") if b[4].strip()]
-    if len(blocks) < 6:
+
+def choose_document_columns(votes: list[int]) -> int:
+    """Choose a document-level column count only with a strict page majority."""
+    normalized = [min(4, max(1, int(vote))) for vote in votes if int(vote) > 0]
+    if not normalized:
         return 1
-    width = page.rect.width or 1.0
-    candidates = [b for b in blocks if (b[2] - b[0]) / width < 0.65]
-    if len(candidates) < 6:
+    count = Counter(normalized)
+    value, occurrences = count.most_common(1)[0]
+    if occurrences * 2 <= len(normalized):
         return 1
-
-    bins = 100
-    occupied = [False] * bins
-    for block in candidates:
-        lo = max(0, min(bins - 1, int(block[0] / width * bins)))
-        hi = max(0, min(bins - 1, int(block[2] / width * bins)))
-        for idx in range(lo, hi + 1):
-            occupied[idx] = True
-
-    runs: list[tuple[int, int]] = []
-    start = None
-    for idx, used in enumerate(occupied + [False]):
-        if used and start is None:
-            start = idx
-        elif not used and start is not None:
-            runs.append((start, idx - 1))
-            start = None
-
-    groups = 0
-    for lo, hi in runs:
-        members = [
-            b for b in candidates
-            if lo <= ((b[0] + b[2]) / 2) / width * bins <= hi
-        ]
-        if len(members) >= 2:
-            groups += 1
-    return min(4, max(1, groups))
+    return value
 
 
 def classify(pages: list[dict]) -> tuple[str, dict]:
@@ -205,7 +197,7 @@ def main() -> None:
     warnings: list[str] = []
     if not page_count:
         doc.close()
-        sys.exit("PDF 没有可处理页面")
+        fail("PDF 没有可处理页面", EXIT_NO_TEXT)
     if getattr(doc, "is_encrypted", False):
         warnings.append("文档已加密；本报告使用了已提供的密码读取内容")
 
@@ -217,7 +209,7 @@ def main() -> None:
         col_counts.append(detect_columns(page))
 
     doc_type, stats = classify(pages)
-    max_cols = max(col_counts) if col_counts else 1
+    max_cols = choose_document_columns(col_counts)
     if max_cols >= 2:
         warnings.append(
             f"疑似 {max_cols} 栏排版：直接抽文本会把左右栏串行拼接，"
